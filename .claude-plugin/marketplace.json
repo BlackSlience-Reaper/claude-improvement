@@ -1,0 +1,11 @@
+{
+  "name": "claude-improvement",
+  "owner": { "name": "BlackSlience-Reaper" },
+  "plugins": [
+    {
+      "name": "usage-band",
+      "source": "./usage-band",
+      "description": "A usage band above the prompt: 5h/7d limits, tokens, speed, cache, clock, cost and context"
+    }
+  ]
+}
