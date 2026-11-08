@@ -6,6 +6,11 @@
       "name": "usage-band",
       "source": "./usage-band",
       "description": "A usage band above the prompt: 5h/7d limits, tokens, speed, cache, clock, cost and context"
+    },
+    {
+      "name": "codex-jobs",
+      "source": "./codex-jobs",
+      "description": "A sidebar of the Codex jobs Claude starts in this session, drawn like the native workflow view, with a footer button that opens and closes it."
     }
   ]
 }
