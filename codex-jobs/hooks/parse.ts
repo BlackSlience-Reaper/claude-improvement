@@ -538,3 +538,172 @@ export const formatTokens = (tokens: number): string =>
     : tokens < 1_000_000
       ? `${(tokens / 1000).toFixed(1).replace('.0', '')}k`
       : `${(tokens / 1_000_000).toFixed(1).replace('.0', '')}m`
+
+// The codex-companion plugin's jobs: `node .../codex-companion.mjs task …`
+// starts one, and its state files say how it goes.
+
+export type CompanionCommand = {
+  subcommand: 'task' | 'review' | 'adversarial-review'
+  prompt?: string
+  model?: string
+  effort?: string
+}
+
+export type CompanionRecord = {
+  id: string
+  kind: string
+  status: string
+  sessionId?: string
+  workspaceRoot?: string
+  summary?: string
+  error?: string
+  prompt?: string
+  model?: string
+  effort?: string
+  write: boolean
+  threadId?: string
+  createdAt: number
+  completedAt?: number
+  updatedAt?: number
+}
+
+const COMPANION_JOBS = new Set(['task', 'review', 'adversarial-review'])
+const COMPANION_FLAGS_WITH_VALUE = new Set([
+  '--model',
+  '-m',
+  '--effort',
+  '--cwd',
+  '--base',
+  '--scope',
+  '--prompt-file',
+  '--resume',
+])
+
+/** The companion job a Bash command starts, or undefined when it starts none. */
+export const parseCompanionCommand = (
+  command: string,
+): CompanionCommand | undefined => {
+  const { text, bodies } = stripHeredocs(command)
+  for (const { words } of splitSegments(text)) {
+    const at = words.findIndex(word => /codex-companion\.mjs$/.test(word))
+    if (at < 0) continue
+    const args = words.slice(at + 1)
+    const subcommand = args[0]
+    if (subcommand === undefined || !COMPANION_JOBS.has(subcommand)) continue
+    const found: CompanionCommand = {
+      subcommand: subcommand as CompanionCommand['subcommand'],
+    }
+    const positionals: string[] = []
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i] ?? ''
+      if (REDIRECT.test(arg)) {
+        if (REDIRECT_ALONE.test(arg)) i++
+      } else if (arg === '--') {
+        positionals.push(...args.slice(i + 1))
+        break
+      } else if (arg.startsWith('-') && arg !== '-') {
+        const equals = arg.indexOf('=')
+        const flag = equals >= 0 ? arg.slice(0, equals) : arg
+        let value = equals >= 0 ? arg.slice(equals + 1) : undefined
+        if (value === undefined && COMPANION_FLAGS_WITH_VALUE.has(flag)) {
+          i++
+          value = args[i]
+        }
+        if (flag === '--model' || flag === '-m') found.model = value
+        if (flag === '--effort') found.effort = value
+      } else positionals.push(arg)
+    }
+    const prompt = positionals.join(' ').trim()
+    found.prompt = prompt !== '' && prompt !== '-' ? prompt : bodies[0]
+
+    return found
+  }
+
+  return undefined
+}
+
+const toTime = (value: unknown): number | undefined => {
+  const ms = typeof value === 'string' ? Date.parse(value) : NaN
+
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+const toText = (value: unknown): string | undefined =>
+  typeof value === 'string' && value !== '' ? value : undefined
+
+/** The jobs in one companion workspace's state.json; malformed ones are skipped. */
+export const parseCompanionState = (raw: string): CompanionRecord[] => {
+  let data: unknown
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  const list = (data as { jobs?: unknown })?.jobs
+  if (!Array.isArray(list)) return []
+  const out: CompanionRecord[] = []
+  for (const job of list as Record<string, unknown>[]) {
+    if (typeof job?.id !== 'string') continue
+    const request = (job.request ?? {}) as Record<string, unknown>
+    out.push({
+      id: job.id,
+      kind: toText(job.kind) ?? toText(job.jobClass) ?? 'task',
+      status: toText(job.status) ?? 'unknown',
+      sessionId: toText(job.sessionId),
+      workspaceRoot: toText(job.workspaceRoot),
+      summary: toText(job.summary),
+      error: toText(job.errorMessage),
+      prompt: toText(request.prompt),
+      model: toText(request.model),
+      effort: toText(request.effort),
+      write: job.write === true,
+      threadId: toText(job.threadId),
+      createdAt: toTime(job.createdAt) ?? toTime(job.startedAt) ?? 0,
+      completedAt: toTime(job.completedAt),
+      updatedAt: toTime(job.updatedAt),
+    })
+  }
+
+  return out
+}
+
+/**
+ * The model and effort a Codex rollout's first turn ran with: the companion
+ * records them only for a background task.
+ */
+export const rolloutSettings = (
+  text: string,
+): { model?: string; effort?: string } => {
+  for (const line of text.split('\n')) {
+    if (!line.includes('"turn_context"')) continue
+    try {
+      const payload = JSON.parse(line).payload ?? {}
+      const settings = payload.collaboration_mode?.settings ?? {}
+
+      return {
+        model: toText(payload.model) ?? toText(settings.model),
+        effort: toText(settings.reasoning_effort) ?? toText(payload.effort),
+      }
+    } catch {
+      return {}
+    }
+  }
+
+  return {}
+}
+
+const LOG_LINE = /^\[[^\]]+\]\s+(.*)$/
+const LOG_NOISE = /^(Reasoning summary$|Command completed:)/
+
+/** A companion job log's progress lines, timestamps dropped, newest last. */
+export const companionActivity = (log: string): string[] => {
+  const out: string[] = []
+  for (const raw of log.replace(/\r\n?/g, '\n').split('\n')) {
+    const match = LOG_LINE.exec(raw.trim())
+    const line = match?.[1]?.replace(/\s+/g, ' ').trim()
+    if (!line || LOG_NOISE.test(line)) continue
+    out.push(line.replace(/^Reasoning summary captured: /, '› ').replaceAll('**', ''))
+  }
+
+  return out.slice(-20)
+}

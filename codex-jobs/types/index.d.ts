@@ -3,14 +3,21 @@ export type JobStatus = 'running' | 'done' | 'failed' | 'stopped' | 'unknown'
 export type JobFilter = JobStatus | 'all'
 
 export type CodexJob = {
-  /** The Bash call's tool_use_id. */
+  /** The Bash call's tool_use_id, or a companion job's own id. */
   id: string
+  /** `companion`: a codex-companion job, read from its state files. */
+  source?: 'cli' | 'companion'
   phaseId: string
   label: string
   subcommand: string
   prompt?: string
   command: string
   model?: string
+  effort?: string
+  /** A companion job's workspace, where its `cancel` runs. */
+  workspaceRoot?: string
+  /** A companion job's state folder, holding its log and result. */
+  stateDir?: string
   status: JobStatus
   /** The background task's id, once the call runs in the background. */
   taskId?: string

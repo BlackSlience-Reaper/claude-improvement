@@ -14,14 +14,19 @@ import type {
   JobsView,
 } from '../types'
 
+import type { CompanionCommand, CompanionRecord } from './parse'
 import {
   clip,
+  companionActivity,
   formatDuration,
   formatTokens,
   headLine,
   parseCodexCommand,
+  parseCompanionCommand,
+  parseCompanionState,
   parseNotification,
   parseOutput,
+  rolloutSettings,
   widthOf,
   wrapLines,
 } from './parse'
@@ -35,6 +40,13 @@ const ACTIVITY_LINES = 5
 const OUTCOME_LINES = 12
 const TWO_COLUMNS_FROM = 64
 const OUTPUT_FILE = /Output is being written to:\s*(.+?\.output)(?=[.\s]|$)/
+// Where the codex-companion plugin keeps its jobs and its scripts, under home.
+const COMPANION_STATE = '.claude/plugins/data/codex-openai-codex/state'
+const COMPANION_SCRIPTS = '.claude/plugins/cache/openai-codex/codex'
+const COMPANION_POLL_MS = 10_000
+const DAY_MS = 24 * 3600 * 1000
+// A job the companion records this long before the Bash call began is not its.
+const CLAIM_SLACK_MS = 5000
 
 // Change a tag when that value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
@@ -81,6 +93,12 @@ type PhaseSummary = {
 }
 
 const isRunning = (job: CodexJob): boolean => job.status === 'running'
+
+const canStop = (job: CodexJob): boolean =>
+  isRunning(job) && (job.taskId !== undefined || job.source === 'companion')
+
+const modelTag = (job: CodexJob): string | undefined =>
+  [job.model, job.effort].filter(Boolean).join(' ') || undefined
 
 const plural = (count: number, word: string): string =>
   `${count} ${word}${count === 1 ? '' : 's'}`
@@ -173,7 +191,7 @@ const settleCall = (
   }
   const text = [stdout, stderr].filter(Boolean).join('\n')
   if (interrupted) {
-    return withOutput({ ...job, status: 'stopped', endedAt: now }, text)
+    return withOutput({ ...job, status: 'stopped' as const, endedAt: now }, text)
   }
   if (isDetached) {
     return {
@@ -186,7 +204,18 @@ const settleCall = (
 }
 
 let ticker: Timer | undefined
+let poller: Timer | undefined
 let ticks = 0
+
+/** Companion Bash calls still running, each waiting to claim its job. */
+type CompanionCall = {
+  command: string
+  description?: string
+  parsed: CompanionCommand
+  at: number
+}
+let calls: CompanionCall[] = []
+let scanning: Promise<void> | undefined
 
 async function setView(
   $: EngineInterface,
@@ -220,9 +249,16 @@ async function readTail(
 async function tick($: EngineInterface): Promise<void> {
   ticks++
   const list = await read($, jobs)
-  if (!list.some(isRunning)) {
+  if (!list.some(isRunning) && calls.length === 0) {
     ticker?.cancel()
     ticker = undefined
+  }
+  if (
+    ticks % 3 === 0 &&
+    (calls.length > 0 ||
+      list.some(job => job.source === 'companion' && isRunning(job)))
+  ) {
+    await scanCompanion($)
   }
   if (ticks % 3 === 0) {
     const { jobId } = await read($, view)
@@ -244,14 +280,8 @@ function keepTicking($: EngineInterface): void {
   })
 }
 
-async function startJob(
-  $: EngineInterface,
-  id: string,
-  command: string,
-  description: string | undefined,
-  parsed: NonNullable<ReturnType<typeof parseCodexCommand>>,
-): Promise<CodexJob> {
-  const startedAt = await $.clock.now()
+/** The current turn's phase, added to the list when it is new. */
+async function currentPhase($: EngineInterface): Promise<string> {
   const current = await read($, turn)
   const phaseId = current.id ?? 'session'
   const known = await read($, phases)
@@ -262,6 +292,234 @@ async function startJob(
     ])
     await setView($, { phaseId: undefined, filter: 'all' })
   }
+
+  return phaseId
+}
+
+async function home($: EngineInterface): Promise<string> {
+  const value =
+    (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+
+  return value.replace(/\\/g, '/')
+}
+
+const companionStatus = (status: string): JobStatus =>
+  status === 'queued' || status === 'running'
+    ? 'running'
+    : status === 'completed'
+      ? 'done'
+      : status === 'failed'
+        ? 'failed'
+        : status === 'cancelled'
+          ? 'stopped'
+          : 'unknown'
+
+/** The companion's own answer, as `/codex:result` would print it. */
+async function companionResult(
+  $: EngineInterface,
+  stateDir: string,
+  id: string,
+): Promise<string | undefined> {
+  const raw = await $.fs.read(`${stateDir}/jobs/${id}.json`).catch(() => '')
+  try {
+    const rendered: unknown = JSON.parse(String(raw)).rendered
+
+    return typeof rendered === 'string' && rendered.trim() !== ''
+      ? rendered.trim()
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The model and effort from the Codex rollout of the job's thread, filed
+ * under the day it started; the day either side covers a time zone.
+ */
+async function rolloutModel(
+  $: EngineInterface,
+  record: CompanionRecord,
+): Promise<{ model?: string; effort?: string }> {
+  const threadId = record.threadId
+  if (threadId === undefined) return {}
+  const codexHome = (
+    (await $.env.get('CODEX_HOME')) ?? `${await home($)}/.codex`
+  ).replace(/\\/g, '/')
+  for (const offset of [0, -DAY_MS, DAY_MS]) {
+    const day = new Date(record.createdAt + offset)
+    const dir = [
+      `${codexHome}/sessions`,
+      day.getUTCFullYear(),
+      String(day.getUTCMonth() + 1).padStart(2, '0'),
+      String(day.getUTCDate()).padStart(2, '0'),
+    ].join('/')
+    const file = (await $.fs.list(dir).catch(() => [])).find(entry =>
+      entry.name.endsWith(`${threadId}.jsonl`),
+    )
+    if (!file) continue
+    // Read once: what it says is kept on the job.
+    const text = await $.fs.read(`${dir}/${file.name}`).catch(() => '')
+
+    return rolloutSettings(String(text))
+  }
+
+  return {}
+}
+
+function claimCall(record: CompanionRecord): CompanionCall | undefined {
+  const call = calls.find(
+    one =>
+      one.parsed.subcommand === record.kind &&
+      record.createdAt >= one.at - CLAIM_SLACK_MS,
+  )
+  if (call) calls = calls.filter(one => one !== call)
+
+  return call
+}
+
+async function companionJob(
+  $: EngineInterface,
+  record: CompanionRecord,
+  stateDir: string,
+  before: CodexJob | undefined,
+  now: number,
+): Promise<CodexJob> {
+  const call = before ? undefined : claimCall(record)
+  const prompt = record.prompt ?? call?.parsed.prompt
+  const base: CodexJob = before ?? {
+    id: record.id,
+    source: 'companion',
+    phaseId: await currentPhase($),
+    label:
+      call?.description?.trim() ||
+      headLine(prompt ?? record.summary ?? '') ||
+      `codex ${record.kind}`,
+    subcommand: record.kind,
+    prompt: prompt ?? record.summary,
+    command: call?.command ?? `codex-companion ${record.kind}`,
+    model: call?.parsed.model ?? record.model,
+    effort: call?.parsed.effort ?? record.effort,
+    workspaceRoot: record.workspaceRoot,
+    stateDir,
+    status: 'running',
+    startedAt: record.createdAt || now,
+  }
+  // A state object is frozen: what the rollout says goes into the copy.
+  const ran: { model?: string; effort?: string } =
+    (base.model ?? record.model) === undefined ||
+    (base.effort ?? record.effort) === undefined
+      ? await rolloutModel($, record).catch(() => ({}))
+      : {}
+  const status = companionStatus(record.status)
+  const log = await $.fs
+    .read(`${stateDir}/jobs/${record.id}.log`)
+    .catch(() => '')
+  const activity = companionActivity(String(log))
+  const job: CodexJob = {
+    ...base,
+    status,
+    model: base.model ?? record.model ?? ran.model,
+    effort: base.effort ?? record.effort ?? ran.effort,
+    activity: activity.length > 0 ? activity : base.activity,
+    endedAt:
+      status === 'running'
+        ? undefined
+        : (record.completedAt ?? record.updatedAt ?? now),
+  }
+  if (status === 'running') return job
+  const outcome = await companionResult($, stateDir, record.id)
+
+  return {
+    ...job,
+    outcome: outcome ?? record.summary,
+    note: status === 'failed' ? (record.error ?? 'The job failed.') : undefined,
+  }
+}
+
+async function scanOnce($: EngineInterface): Promise<void> {
+  const root = `${await home($)}/${COMPANION_STATE}`
+  const sessionId = await $.session.id()
+  const found: { record: CompanionRecord; stateDir: string }[] = []
+  for (const dir of await $.fs.list(root).catch(() => [])) {
+    if (dir.kind !== 'dir') continue
+    const stateDir = `${root}/${dir.name}`
+    const raw = await $.fs.read(`${stateDir}/state.json`).catch(() => '')
+    for (const record of parseCompanionState(String(raw))) {
+      if (record.sessionId === sessionId) found.push({ record, stateDir })
+    }
+  }
+  if (found.length === 0) return
+  found.sort((a, b) => a.record.createdAt - b.record.createdAt)
+  const known = new Map((await read($, jobs)).map(job => [job.id, job]))
+  const now = await $.clock.now()
+  const changed = new Map<string, CodexJob>()
+  const added: CodexJob[] = []
+  for (const { record, stateDir } of found) {
+    const before = known.get(record.id)
+    // A settled job stays as it ended.
+    if (before && !isRunning(before)) continue
+    const job = await companionJob($, record, stateDir, before, now)
+    if (before) changed.set(job.id, job)
+    else added.push(job)
+  }
+  if (changed.size === 0 && added.length === 0) return
+  const list = await update($, jobs, all =>
+    [...all.map(job => changed.get(job.id) ?? job), ...added].slice(-MAX_JOBS),
+  )
+  await update($, phases, all =>
+    all.filter(phase => list.some(one => one.phaseId === phase.id)),
+  )
+  if (added.some(isRunning)) keepTicking($)
+  if (added.length > 0 && !(await read($, view)).isDismissed) {
+    void openPane($).catch(() => undefined)
+  }
+  $.ui.invalidate('ui.render')
+}
+
+/** Reads the companion's state files into the jobs; one read at a time. */
+async function scanCompanion($: EngineInterface): Promise<void> {
+  scanning ??= scanOnce($)
+    .catch(() => undefined)
+    .finally(() => {
+      scanning = undefined
+    })
+
+  return scanning
+}
+
+/** Asks the companion to cancel its job, as `/codex:cancel` does. */
+async function cancelCompanion(
+  $: EngineInterface,
+  job: CodexJob,
+): Promise<boolean> {
+  const root = `${await home($)}/${COMPANION_SCRIPTS}`
+  const versions = (await $.fs.list(root).catch(() => []))
+    .filter(entry => entry.kind === 'dir')
+    .map(entry => entry.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+  const version = versions.at(-1)
+  if (version === undefined) return false
+  const script = `${root}/${version}/scripts/codex-companion.mjs`
+  const args = ['node', script, 'cancel', job.id]
+  if (job.workspaceRoot) args.push('--cwd', job.workspaceRoot)
+  const { exitCode } = await $.process.run(args, {
+    timeoutMs: 15_000,
+    env: { CODEX_COMPANION_SESSION_ID: await $.session.id() },
+  })
+  await scanCompanion($)
+
+  return exitCode === 0
+}
+
+async function startJob(
+  $: EngineInterface,
+  id: string,
+  command: string,
+  description: string | undefined,
+  parsed: NonNullable<ReturnType<typeof parseCodexCommand>>,
+): Promise<CodexJob> {
+  const startedAt = await $.clock.now()
+  const phaseId = await currentPhase($)
   const job: CodexJob = {
     id,
     phaseId,
@@ -314,7 +572,7 @@ async function markStopped($: EngineInterface, taskId: string): Promise<void> {
   await update($, jobs, list =>
     list.map(job =>
       job.taskId === taskId && isRunning(job)
-        ? { ...job, status: 'stopped', endedAt: now }
+        ? { ...job, status: 'stopped' as const, endedAt: now }
         : job,
     ),
   )
@@ -375,6 +633,12 @@ export const register: Register = on => {
       description: 'Show the Codex jobs of this session in a pane',
     })
     if ((await read($, jobs)).some(isRunning)) keepTicking($)
+    await scanCompanion($)
+    // The net under a companion job started where no Bash call was seen.
+    poller?.cancel()
+    poller = $.clock.every(COMPANION_POLL_MS, () => {
+      void scanCompanion($)
+    })
 
     return next(e)
   })
@@ -433,6 +697,26 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const companion = parseCompanionCommand(e.command)
+    if (companion) {
+      const call: CompanionCall = {
+        command: e.command,
+        description: e.description,
+        parsed: companion,
+        at: await $.clock.now(),
+      }
+      calls = [...calls, call].slice(-20)
+      keepTicking($)
+      try {
+        return await next(e)
+      } finally {
+        // A background job is recorded by now, a foreground one has ended. A
+        // read already under way may predate it, so one more follows.
+        await scanCompanion($)
+        await scanCompanion($)
+        calls = calls.filter(one => one !== call)
+      }
+    }
     const parsed = parseCodexCommand(e.command)
     if (!parsed) return next(e)
     const job = await startJob(
@@ -482,7 +766,7 @@ export const register: Register = on => {
           !inFlight.some(task => task.id === job.taskId)
             ? {
                 ...job,
-                status: 'unknown',
+                status: 'unknown' as const,
                 endedAt: now,
                 note: 'The task ended without a completion notice.',
               }
@@ -511,6 +795,11 @@ export const register: Register = on => {
       summaries.at(-1)
 
     const stopJob = async (job: CodexJob): Promise<void> => {
+      if (job.source === 'companion') {
+        const isCancelled = await cancelCompanion($, job).catch(() => false)
+        if (!isCancelled) $.ui.toast(`Could not stop ${job.label}.`)
+        return
+      }
       if (job.taskId === undefined) return
       const ran = await $.tool.call({
         tool: 'TaskStop',
@@ -658,7 +947,9 @@ export const register: Register = on => {
       const position = phase ? phase.own.indexOf(openJob) + 1 : 1
       const status = STATUS[openJob.status]
       const room = width - 6
-      const meta = [openJob.model, openJob.subcommand].filter(Boolean).join(' · ')
+      const meta = [openJob.model, openJob.effort, openJob.subcommand]
+        .filter(Boolean)
+        .join(' · ')
       const toLines = (text: string | undefined) =>
         text ? wrapLines(text, room) : []
       const promptLines = toLines(openJob.prompt ?? openJob.command)
@@ -669,8 +960,7 @@ export const register: Register = on => {
         activityLines.length - ACTIVITY_LINES >= 2 ||
         outcomeLines.length - OUTCOME_LINES >= 2
       const noteColor = openJob.status === 'failed' ? 'error' : undefined
-      const stop =
-        isRunning(openJob) && openJob.taskId !== undefined
+      const stop = canStop(openJob)
           ? [
               {
                 key: 'stop',
@@ -731,7 +1021,7 @@ export const register: Register = on => {
               fromEnd: true,
               empty: !isRunning(openJob)
                 ? 'No activity captured.'
-                : openJob.outputFile
+                : openJob.outputFile || openJob.source === 'companion'
                   ? 'No output yet.'
                   : 'Output appears when the job finishes.',
             })}
@@ -851,7 +1141,8 @@ export const register: Register = on => {
 
     const jobRow = (job: CodexJob) => {
       const status = STATUS[job.status]
-      const parts = jobStats(job, now)
+      const tag = modelTag(job)
+      const parts = tag ? [tag, ...jobStats(job, now)] : jobStats(job, now)
       // Duration last and kept: the rest give way first when the pane is thin.
       while (parts.length > 1 && widthOf(parts.join(' · ')) > jobRoom - 14) {
         parts.shift()
@@ -899,9 +1190,7 @@ export const register: Register = on => {
     const filter = present.includes(state.filter) ? state.filter : 'all'
     const shown = filter === 'all' ? own : own.filter(job => job.status === filter)
     const filterWord = filter === 'all' ? '' : STATUS[filter].label.toLowerCase()
-    const stoppable = own.filter(
-      job => isRunning(job) && job.taskId !== undefined,
-    )
+    const stoppable = own.filter(canStop)
 
     const jobsCard = (
       <Box
