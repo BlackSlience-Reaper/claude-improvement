@@ -20,6 +20,11 @@ const measure = atom({ plugin: 'usage-band', key: 'measure' } as const, null, {
 const tokens = atom({ plugin: 'usage-band', key: 'tokens' } as const, ZERO, {
   shape: 'tokens-1',
 })
+// The Fable weekly window, which the engine reads off each model response but
+// leaves out of `rateLimits`: null until a response has carried it.
+const fable = atom({ plugin: 'usage-band', key: 'fable' } as const, null, {
+  shape: 'fable-1',
+})
 const speed = atom({ plugin: 'usage-band', key: 'speed' } as const, null)
 const minute = atom({ plugin: 'usage-band', key: 'minute' } as const, 0)
 const dayTotal = atom({ plugin: 'usage-band', key: 'dayTotal' } as const, null)
@@ -42,6 +47,9 @@ const ROOM_PX_PER_CELL = 8.5
 const GAP_PX = 9
 // Bars grow into the room the chosen fit leaves, up to this many cells.
 const MAX_BAR_CELLS = 8
+// The response headers of the Fable weekly window: its fill from 0 to 1, and
+// when it resets in epoch seconds.
+const FABLE_HEADER = 'anthropic-ratelimit-unified-7d_oi-'
 
 type Snapshot = {
   context: SessionContextUsage
@@ -52,6 +60,7 @@ type Snapshot = {
 type ChipId =
   | '5h'
   | '7d'
+  | 'fable'
   | 'spend'
   | 'in'
   | 'out'
@@ -107,6 +116,7 @@ const TIGHTEST: Fit = {
 type View = {
   fiveHour?: Limit
   sevenDay?: Limit
+  fable?: Limit
   spend?: Limit
   until: string | null
   fresh: number
@@ -281,7 +291,8 @@ const buildGroups = (v: View, fit: Fit): Chip[][] => {
   const groups: Chip[][] = [
     [
       ...limit('5h', '5h', v.fiveHour, reset),
-      ...limit('7d', '7d', v.sevenDay),
+      ...limit('7d', '7d', v.sevenDay, v.fiveHour === undefined ? reset : []),
+      ...limit('fable', 'fable', v.fable),
       ...limit('spend', 'spend', v.spend),
     ],
     [
@@ -380,6 +391,22 @@ async function record($: EngineInterface, s: Snapshot, lastCost: number | null) 
   return usd
 }
 
+// The Fable window a model response's headers carry, or null where they carry
+// none: the fill as a percent with at most one decimal, as the engine's are.
+const fableOf = (headers: Record<string, string>): Limit | null => {
+  const used = Number(headers[`${FABLE_HEADER}utilization`] ?? '')
+  if (headers[`${FABLE_HEADER}utilization`] === undefined || !Number.isFinite(used)) return null
+  const reset = Number(headers[`${FABLE_HEADER}reset`] ?? '')
+
+  return {
+    kind: 'fable',
+    percent: Math.round(used * 1000) / 10,
+    ...(Number.isFinite(reset) && reset > 0
+      ? { resetsAt: new Date(reset * 1000).toISOString() }
+      : {}),
+  }
+}
+
 async function tick($: EngineInterface) {
   const now = await $.clock.now()
   const at = Math.floor(now / 60_000) * 60_000
@@ -416,6 +443,27 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // The engine's own model requests answer with the account's windows in
+  // their headers; the response goes on untouched.
+  on('http.fetch', async ($, e, next) => {
+    const res = await next(e)
+    if (next.origin.plugin !== 'engine') return res
+    try {
+      const headers = (res as { headers?: Record<string, string> }).headers
+      const seen = headers === undefined ? null : fableOf(headers)
+      if (seen !== null) {
+        const held = await read($, fable)
+        if (held?.percent !== seen.percent || held.resetsAt !== seen.resetsAt) {
+          await update($, fable, () => seen)
+        }
+      }
+    } catch {
+      // A reading that fails is only a reading missed.
+    }
+
+    return res
+  })
+
   // Every response's tokens count toward the session's totals; the speed is the
   // main loop's last response, its output over the time it streamed.
   on('turn.step', async function* ($, e, next) {
@@ -442,13 +490,20 @@ export const register: Register = on => {
     const t = await read($, tokens)
     const now = await read($, minute)
     const fiveHour = m?.limits.find(l => l.kind === 'five_hour')
+    const sevenDay = m?.limits.find(l => l.kind === 'seven_day')
+    // A plan with no five-hour window (Ultra) shows the weekly one with its
+    // reset, and Fable's beside it; a Fable reading past its reset is dropped.
+    const f = fiveHour === undefined ? await read($, fable) : null
+    const isFableLive =
+      f !== null && (f.resetsAt === undefined || now === 0 || Date.parse(f.resetsAt) > now)
     const fresh = t.input + t.cacheWrite
     const allInput = fresh + t.cacheRead
     const view: View = {
       fiveHour,
-      sevenDay: m?.limits.find(l => l.kind === 'seven_day'),
+      sevenDay,
+      fable: f !== null && isFableLive ? f : undefined,
       spend: m?.limits.find(l => l.kind === 'spend_limit'),
-      until: fmtUntil(fiveHour?.resetsAt, now),
+      until: fmtUntil((fiveHour ?? sevenDay)?.resetsAt, now),
       fresh,
       output: t.output,
       tps: await read($, speed),

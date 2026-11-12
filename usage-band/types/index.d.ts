@@ -17,6 +17,7 @@ declare module 'claude-code' {
     'usage-band': {
       measure: Shaped<Measure | null>
       tokens: Shaped<Tokens>
+      fable: Shaped<Limit | null>
       speed: number | null
       minute: number
       dayTotal: number | null

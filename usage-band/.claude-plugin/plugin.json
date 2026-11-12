@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
   "version": "0.1.0",
-  "description": "A usage band above the prompt: 5h/7d limits, tokens, speed, cache, clock, cost and context",
+  "description": "A usage band above the prompt: 5h/7d limits (7d/Fable on a plan with no 5h window), tokens, speed, cache, clock, cost and context",
   "types": "./types/index.d.ts"
 }
